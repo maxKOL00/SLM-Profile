@@ -2,6 +2,8 @@
 #include "Thrower.h"
 #include <fstream>
 #include <math.h>
+#include <random>
+#include <complex>
 
 
 
@@ -12,6 +14,21 @@ cufftDoubleComplex evaluate_complex_exponetial(double phase, double amplitude) {
     value.x = real;
     value.y = imag;
     return value;
+}
+
+#define IDX2R(i,j,N) (((i)*(N))+(j))
+__global__ void fftshift_2D(cufftDoubleComplex* data, int N)
+{
+    int i = threadIdx.y + blockDim.y * blockIdx.y;
+    int j = threadIdx.x + blockDim.x * blockIdx.x;
+
+    if (i < N && j < N)
+    {
+        double a = 1 - 2 * ((i + j) & 1);
+        //double a = pow(-1.0, (i + j) & 1); above is faster
+        data[IDX2R(i, j, N)].x *= a;
+        data[IDX2R(i, j, N)].y *= a;
+    }
 }
 
 double cudaCore::gaussian(int i, int j) {
@@ -30,25 +47,46 @@ double cudaCore::gaussian(int i, int j) {
     return exp(-1 * res);
 }
 
+double random_phase() {
+    double lower_bound = 0;
+    double upper_bound = 3.14159;
+    std::random_device rd;  //Will be used to obtain a seed for the random number engine
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<double> unif(lower_bound, upper_bound);
+    double a_random_double = unif(gen) - unif(gen);
+    return a_random_double;
+}
+
 void cudaCore::createArrays() {
     //calculate the number of pixels between the traps in target image
     //resolution = 108695*850nm*20mm/(telescope_mag*active)
     double resolution = (108695.0 * 850 * pow(10, -9) * 0.020) / (3.3 * NX);//not sure if padded or unpadded size
-    int num_pix = trap_spacing / resolution;
+    int num_pix = trap_spacing * 0.000001 / resolution;
     if (num_pix < 1) {
         num_pix = 2;
     }
-    int st = int(mid - ((dim / 2) * num_pix));//find the upper left corner of the trap array
+    if (dim % 2 == 0) {
+        st = int(mid - ((dim / 2) * num_pix) + (num_pix/2));
+    }
+    else {
+        st = int(mid - ((dim / 2) * num_pix));//find the upper left corner of the trap array
+    }
+    if (st < 0) {
+        thrower("the number of traps is too large for the given resolution and trap spacing");
+    }
     for (size_t y_coord = 0; y_coord < NY; y_coord++) {
         for (size_t x_coord = 0; x_coord < NX; x_coord++) {
             double gauss = gaussian(y_coord, x_coord);
             input_intensity[y_coord * NX + x_coord] = gauss;
-            cufftDoubleComplex value = evaluate_complex_exponetial(rand() % 6, gauss);
+            cufftDoubleComplex value = evaluate_complex_exponetial(random_phase(), gauss);
             DiffPlane[y_coord * NX + x_coord].x = value.x;
             DiffPlane[y_coord * NX + x_coord].y = value.y;
             if (x_coord >= st && y_coord >= st && x_coord <= (st + ((dim - 1) * num_pix)) && y_coord <= (st + ((dim - 1) * num_pix))) {
-                if ((((x_coord - st) % dim) == 0) && (((y_coord - st) % dim) == 0)) {
-                    target[y_coord * NX + x_coord] == 1;
+                if ((((x_coord - st) % int(num_pix)) == 0)) {
+                    if (((y_coord - st) % int(num_pix)) == 0) {
+                        target[y_coord * NX + x_coord] = 1;
+                        st = st;
+                    }
                 }
             }
             else {
@@ -63,6 +101,7 @@ cudaCore::cudaCore(size_t nx, size_t ny, int activen, double spacing, int Dim) {
     NY = ny;
     trap_spacing = spacing;
     dim = Dim;
+    mid = nx / 2;
     /*const size_t row_pointers_bytes = NY * sizeof * phaseN;
     const size_t row_elements_bytes = NX * sizeof * *phaseN;*/
     phaseN = new double[NY * NX];
@@ -76,7 +115,7 @@ cudaCore::cudaCore(size_t nx, size_t ny, int activen, double spacing, int Dim) {
             thrower("CUDA Error on %s\n", cudaGetErrorString(err));
         }
         GPU_name = (prop.name);
-        if (GPU_name == "NVIDIA geforce 2080") {
+        if (GPU_name == "GeForce RTX 2080 SUPER") {
             cudaSetDevice(i);
             break;
         }
@@ -124,7 +163,18 @@ cufftDoubleComplex* cudaCore::get_diff_plane() {
 }
 
 void cudaCore::execfft() {
-    cufftExecZ2Z(plan, DiffPlane, ImagePlane, CUFFT_FORWARD);
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks(NX / threadsPerBlock.x, NY / threadsPerBlock.y);
+    cufftDoubleComplex* diffTemp;
+    cudaMalloc((void**)&diffTemp, sizeof(cufftDoubleComplex) * NX * (NY));
+    err = cudaMemcpy(diffTemp, DiffPlane, sizeof(cufftDoubleComplex) * NX * (NY), cudaMemcpyDeviceToDevice);
+    if (err != cudaSuccess) {
+        thrower("Cuda error: Failed to allocate diffPlane data\n");
+    }
+    fftshift_2D << <numBlocks, threadsPerBlock >> > (diffTemp, NX);//compiles fine
+    cufftExecZ2Z(plan, diffTemp, ImagePlane, CUFFT_FORWARD);
+    fftshift_2D << <numBlocks, threadsPerBlock >> > (ImagePlane, NX);
+    cudaFree(diffTemp);
     if (cudaGetLastError() != cudaSuccess) {
         thrower("Cuda error: Failed to execute fft\n");
     }
@@ -140,7 +190,19 @@ void cudaCore::execfft() {
 }
 
 void cudaCore::execifft() {
-    cufftExecZ2Z(plan, ImagePlane, DiffPlane, CUFFT_INVERSE);
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks(NX / threadsPerBlock.x, NY / threadsPerBlock.y);
+    cufftDoubleComplex* ImgTemp;
+    cudaMalloc((void**)&ImgTemp, sizeof(cufftDoubleComplex) * NX * (NY));
+    err = cudaMemcpy(ImgTemp, ImagePlane, sizeof(cufftDoubleComplex) * NX * (NY), cudaMemcpyDeviceToDevice);
+    if (err != cudaSuccess) {
+        thrower("Cuda error: Failed to allocate diffPlane data\n");
+    }
+    fftshift_2D << <numBlocks, threadsPerBlock >> > (ImgTemp, NX);//compiles fine
+    cufftExecZ2Z(plan, ImgTemp, DiffPlane, CUFFT_INVERSE);
+    fftshift_2D << <numBlocks, threadsPerBlock >> > (DiffPlane, NX);
+    cudaFree(ImgTemp);
+
     if (cudaGetLastError() != cudaSuccess) {
         thrower("Cuda error: Failed to execute fft\n");
     }
@@ -155,43 +217,47 @@ void cudaCore::execifft() {
     }
 }
 
-__global__ void newPhase(cufftDoubleReal* amp, cufftDoubleComplex* B, int N) {
-
+__global__ void newPhase(cufftDoubleReal* input_intensity, cufftDoubleComplex* DiffPlane, int N) {
+    //IDK if this is the fastest way
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     cufftDoubleComplex value;
     double phase;
     if (i < N && j < N) {
-        phase = atan(B[i * N + j].y / B[i * N + j].x);
-        value.x = amp[i * N + j] * cos(phase);
-        value.y = amp[i * N + j] * sin(phase);
-        B[i * N + j] = value;
+        phase = atan2(DiffPlane[i * N + j].y, DiffPlane[i * N + j].x);
+        value.x = input_intensity[i * N + j] * cos(phase);
+        value.y = input_intensity[i * N + j] * sin(phase);
+        DiffPlane[i * N + j] = value;
+    }
+}
+
+
+__global__ void newAmp(cufftDoubleReal* target, cufftDoubleComplex* C, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    cufftDoubleComplex value;
+    double phase;
+    if (i < N && j < N) {
+        phase = atan2(C[i * N + j].y , C[i * N + j].x);
+        value.x = target[i * N + j] * cos(phase);
+        value.y = target[i * N + j] * sin(phase);
+        C[i * N + j] = value;
     }
 }
 
 void cudaCore::swapPhase() {
 
     dim3 threadsPerBlock(16, 16);
+    size_t free, total;
     dim3 numBlocks(NX / threadsPerBlock.x, NY / threadsPerBlock.y);
-
+    cudaMemGetInfo(&free, &total);
+    
     newPhase << <numBlocks, threadsPerBlock >> > (input_intensity, DiffPlane, NX);//compiles fine
     if (cudaThreadSynchronize() != cudaSuccess) {//Otherwise the cpu can't find where the data went
         thrower("Cuda error: Failed to synchronize\n");
     }
-}
-
-__global__ void newAmp(cufftDoubleReal* target, cufftDoubleComplex* C, int N) {
-
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-    cufftDoubleComplex value;
-    double phase;
-    if (i < N && j < N) {
-        phase = atan(C[i * N + j].y / C[i * N + j].x);
-        value.x = target[i * N + j] * cos(phase);
-        value.y = target[i * N + j] * sin(phase);
-        C[i * N + j] = value;
-    }
+    cudaMemGetInfo(&free, &total);
+    
 }
 
 void cudaCore::swapAmp() {
@@ -207,8 +273,8 @@ void cudaCore::swapAmp() {
 
 void cudaCore::weightImage() {
     double resolution = (108695.0 * 850 * pow(10, -9) * 0.020) / (3.3 * NX);//not sure if padded or unpadded size
-    int num_pix = trap_spacing / resolution;
-    int st = int(mid - ((dim / 2) * num_pix));//find the upper left corner of the trap array
+    int num_pix = trap_spacing * 0.000001 / resolution;
+
     double total = 0;
     for (size_t y_coord = 0; y_coord < dim; y_coord++) {
         for (size_t x_coord = 0; x_coord < dim; x_coord++) {
@@ -234,10 +300,10 @@ void cudaCore::setPaddedSize(int size) {
     NX = size;
     NY = size;
     norm = NX * NY;
+    mid = size / 2;
 }
 void cudaCore::setActiveSize(int size) {
     activeN = size;
-    mid = activeN / 2;
 }
 void cudaCore::setTrapSpacing(double spacing) {
     trap_spacing = spacing;
@@ -249,8 +315,7 @@ void cudaCore::setDim(int Dim) {
 void cudaCore::weightImage2() {
     //Englund just used the average amplitude over the amp. of the trap.
     double resolution = (108695.0 * 850 * pow(10, -9) * 0.020) / (3.3 * NX);//not sure if padded or unpadded size
-    int num_pix = trap_spacing / resolution;
-    int st = int(mid - ((dim / 2) * num_pix));//find the upper left corner of the trap array
+    int num_pix = trap_spacing * 0.000001 / resolution;
     double total = 0;
     for (size_t y_coord = 0; y_coord < dim; y_coord++) {
         for (size_t x_coord = 0; x_coord < dim; x_coord++) {
@@ -275,27 +340,61 @@ void cudaCore::weightImage2() {
 }
 
 void cudaCore::saveDiffPlane() {
-    std::ofstream file("DiffPlaneValues.txt");
+    cudaDeviceSynchronize();
+    std::ofstream file("DiffPlaneValues.txt", std::ofstream::out | std::ofstream::trunc);
     double real, imag;
+    double value;
     for (size_t y_coord = 0; y_coord < NY; y_coord++) {
         for (size_t x_coord = 0; x_coord < NX; x_coord++) {
             real = DiffPlane[y_coord * NX + x_coord].x;
             imag = DiffPlane[y_coord * NX + x_coord].y;
-            file << (pow(real, 2) + pow(imag, 2)) << "/n";
+            value = (pow(real, 2) + pow(imag, 2));
+            file << value << " ";
         }
+        file << std::endl;
     }
     file.close();
 }
 
 void cudaCore::saveImageBitmap() {
-    std::ofstream file("ImagePlaneValues.txt");
+    //cudaDeviceSynchronize();
+    std::ofstream file("ImagePlaneValues.txt", std::ofstream::out | std::ofstream::trunc);
     double real, imag;
     for (size_t y_coord = 0; y_coord < NY; y_coord++) {
         for (size_t x_coord = 0; x_coord < NX; x_coord++) {
             real = ImagePlane[y_coord * NX + x_coord].x;
             imag = ImagePlane[y_coord * NX + x_coord].y;
-            file << (pow(real, 2) + pow(imag, 2)) << "/n";
+            file << (real*real) + (imag * imag) << " ";
         }
+        file << std::endl;
+    }
+    file.close();
+}
+
+void cudaCore::saveTarget() {
+    //cudaDeviceSynchronize();
+    std::ofstream file("Target.txt", std::ofstream::out | std::ofstream::trunc);
+    double real;
+    for (size_t y_coord = 0; y_coord < NY; y_coord++) {
+        for (size_t x_coord = 0; x_coord < NX; x_coord++) {
+            real = target[y_coord * NX + x_coord];
+            file << real << " ";
+        }
+        file << std::endl;
+    }
+    file.close();
+}
+
+void cudaCore::savePhasePlot() {
+    //cudaDeviceSynchronize();
+    std::ofstream file("Phase.txt", std::ofstream::out | std::ofstream::trunc);
+    double phase;
+    for (size_t y_coord = 0; y_coord < NY; y_coord++) {
+        for (size_t x_coord = 0; x_coord < NX; x_coord++) {
+            phase = atan2(DiffPlane[y_coord * NX + x_coord].y, DiffPlane[y_coord * NX + x_coord].x);
+            file << phase << " ";
+        }
+        file << std::endl;
     }
     file.close();
 }
@@ -304,7 +403,7 @@ void cudaCore::savePhaseN() {
     double phase;
     for (size_t y_coord = 0; y_coord < NY; y_coord++) {
         for (size_t x_coord = 0; x_coord < NX; x_coord++) {
-            phase = atan(ImagePlane[y_coord * NX + x_coord].y / ImagePlane[y_coord * NX + x_coord].x);
+            phase = atan2(ImagePlane[y_coord * NX + x_coord].y, ImagePlane[y_coord * NX + x_coord].x);
             *(phaseN + y_coord * NX + x_coord) = phase;
         }
     }

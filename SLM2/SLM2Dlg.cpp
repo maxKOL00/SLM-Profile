@@ -21,14 +21,14 @@
 
 
 CSLM2Dlg::CSLM2Dlg(CWnd* pParent /*=nullptr*/)
-	: CDialogEx(IDD_SLM2_DIALOG, pParent)
+	: CDialogEx(IDD_SLM2_DIALOG, pParent), SLM(256, 256, 128, 50, 5)
 	, m_edit1C()
 	, m_edit2C()
 	, m_edit3C()
 	, m_edit4C()
 
 {
-	m_hIcon = AfxGetApp()->LoadIcon(IDR_MAINFRAME);
+	m_hIcon = AfxGetApp()->LoadIcon(IDI_ICON1);
 }
 
 void CSLM2Dlg::DoDataExchange(CDataExchange* pDX)
@@ -122,10 +122,13 @@ void CSLM2Dlg::OnBnClickedButton1()
 	SLM.setNY(256);
 	SLM.setActive(128);
 	SLM.setSpace(50);//needs to be changed later
-	SLM.setDim(10);//
+	SLM.setDim(int(m_edit4C));//
 	SLM.populateArrays();
+	SLM.saveDiffPlaneAsBitmap();
 	SLM.gerchbergPhaseLoop(int(m_edit1C));
 	SLM.gerchbergAmpLoop(int(m_edit2C));
+	SLM.saveDiffPlaneAsBitmap();
+	SLM.saveImageAsBitmap();
 }
 
 

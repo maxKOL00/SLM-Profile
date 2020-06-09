@@ -29,12 +29,14 @@ class cudaCore {
 		__host__ void saveDiffPlane();
 		__host__ void saveImageBitmap();
 		__host__ void createArrays();
+		__host__ void saveTarget();
+		__host__ void savePhasePlot();
 	private:
 		size_t NX;
 		size_t NY;
 		int activeN;
 		int mid, dim;
-		int norm;
+		int norm, st;
 		double trap_spacing;
 		std::string GPU_name;
 		double *phaseN; // can't use vector or other stl function in cuda
